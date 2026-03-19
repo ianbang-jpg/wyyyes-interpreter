@@ -503,6 +503,18 @@ async function translateText(text, from, to) {
   }
 }
 
+// ===== AUDIO CONTEXT (Autoplay unlock) =====
+let audioCtx = null;
+function ensureAudioCtx() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  return audioCtx;
+}
+// Unlock audio on ANY user interaction
+['click','touchstart','keydown'].forEach(evt => {
+  document.addEventListener(evt, () => ensureAudioCtx(), { once: false, passive: true });
+});
+
 // ===== TTS (ElevenLabs) =====
 async function speakTTS(text, targetLang) {
   if (!S.connected || !S.apiKey) return;
@@ -510,29 +522,18 @@ async function speakTTS(text, targetLang) {
   const voiceId = targetLang === 'ko' ? S.voiceKR : S.voiceJP;
   if (!voiceId) return;
 
-  // 번역된 음성은 상대방 패널에서 재생 (한국어→일본어 TTS면 일본어 패널에서)
   const audioIndicator = targetLang === 'ja' ? audioJP : audioKR;
 
   try {
-    // Stop any currently playing audio
-    if (S.currentAudio) {
-      S.currentAudio.pause();
-      S.currentAudio = null;
-    }
+    if (S.currentAudio) { S.currentAudio.pause(); S.currentAudio = null; }
 
     const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
       method: 'POST',
-      headers: {
-        'xi-api-key': S.apiKey,
-        'Content-Type': 'application/json'
-      },
+      headers: { 'xi-api-key': S.apiKey, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         text: text,
         model_id: 'eleven_multilingual_v2',
-        voice_settings: {
-          stability: S.stability,
-          similarity_boost: S.similarity
-        }
+        voice_settings: { stability: S.stability, similarity_boost: S.similarity }
       })
     });
 
@@ -543,30 +544,31 @@ async function speakTTS(text, targetLang) {
       return;
     }
 
-    const blob = await res.blob();
-    const audioUrl = URL.createObjectURL(blob);
-    const audio = new Audio(audioUrl);
-    S.currentAudio = audio;
+    // Decode via AudioContext (bypasses autoplay restrictions)
+    const ctx = ensureAudioCtx();
+    const arrayBuf = await res.arrayBuffer();
+    const audioBuf = await ctx.decodeAudioData(arrayBuf);
 
-    // Show audio indicator on the TARGET panel
     audioIndicator.classList.add('active');
 
-    // Wait for audio to finish playing before returning
     await new Promise((resolve) => {
-      audio.onended = () => {
-        URL.revokeObjectURL(audioUrl);
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuf;
+      source.connect(ctx.destination);
+      S.currentAudio = source;
+
+      source.onended = () => {
         audioIndicator.classList.remove('active');
         S.currentAudio = null;
         resolve();
       };
-      audio.onerror = () => {
-        audioIndicator.classList.remove('active');
-        S.currentAudio = null;
-        resolve();
-      };
-      audio.play().catch(() => resolve());
+
+      source.start(0);
     });
   } catch(e) {
+    audioIndicator.classList.remove('active');
+    S.currentAudio = null;
+    console.error('TTS error:', e);
     showToast('음성 합성 실패: ' + e.message, 'error');
   }
 }
