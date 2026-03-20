@@ -350,6 +350,7 @@ async function connectAPI() {
     connectBtn.textContent = '연결됨 ✓';
     connectBtn.classList.add('connected');
     settingsBar.style.display = 'flex';
+    localStorage.setItem('wyyyes_api_key', key);
     showToast(`연결 성공! ${S.voices.length}개 음성 로드`, 'success');
   } catch(e) {
     statusDot.className = 'status-dot err';
@@ -856,10 +857,12 @@ cloneUploadBtn.onclick = async () => {
 };
 
 // ===== AUTO-CONNECT ON LOAD =====
-const SAVED_KEY = 'sk_147dbfbd904795897c4bc0522374f456cc5c7d57652044d6';
 window.addEventListener('DOMContentLoaded', () => {
-  apiKeyInput.value = SAVED_KEY;
-  connectAPI();
+  const saved = localStorage.getItem('wyyyes_api_key');
+  if (saved) {
+    apiKeyInput.value = saved;
+    connectAPI();
+  }
 });
 </script>
 </body>
