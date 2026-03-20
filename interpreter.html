@@ -407,6 +407,9 @@ function toggleRec(panel) {
 }
 
 function startRec(panel) {
+  // CRITICAL: Unlock audio during this user gesture so TTS can play later on mobile
+  unlockAudio();
+
   const lang = panel === 'kr' ? 'ko-KR' : 'ja-JP';
   const mic = panel === 'kr' ? micKR : micJP;
   const transcript = panel === 'kr' ? transcriptKR : transcriptJP;
@@ -424,6 +427,9 @@ function startRec(panel) {
   let finalText = '';
 
   r.onresult = (e) => {
+    // Keep AudioContext alive while recognition is active
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+
     let interim = '';
     let final = '';
     for (let i = e.resultIndex; i < e.results.length; i++) {
@@ -503,16 +509,35 @@ async function translateText(text, from, to) {
   }
 }
 
-// ===== AUDIO CONTEXT (Autoplay unlock) =====
+// ===== AUDIO CONTEXT (Mobile-safe autoplay unlock) =====
 let audioCtx = null;
+let audioUnlocked = false;
+
 function ensureAudioCtx() {
   if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   if (audioCtx.state === 'suspended') audioCtx.resume();
   return audioCtx;
 }
-// Unlock audio on ANY user interaction
-['click','touchstart','keydown'].forEach(evt => {
-  document.addEventListener(evt, () => ensureAudioCtx(), { once: false, passive: true });
+
+// Play a silent buffer to fully unlock audio on mobile browsers.
+// Must be called inside a user gesture (click/touchstart) handler.
+function unlockAudio() {
+  const ctx = ensureAudioCtx();
+  if (audioUnlocked && ctx.state === 'running') return;
+  try {
+    const buf = ctx.createBuffer(1, 1, 22050);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    src.start(0);
+    src.onended = () => { audioUnlocked = true; };
+    if (ctx.state === 'suspended') ctx.resume();
+  } catch(e) { console.warn('Audio unlock failed:', e); }
+}
+
+// Unlock audio on ANY user interaction (covers both desktop & mobile)
+['click','touchstart','touchend','keydown'].forEach(evt => {
+  document.addEventListener(evt, unlockAudio, { passive: true });
 });
 
 // ===== TTS (ElevenLabs) =====
@@ -525,7 +550,7 @@ async function speakTTS(text, targetLang) {
   const audioIndicator = targetLang === 'ja' ? audioJP : audioKR;
 
   try {
-    if (S.currentAudio) { S.currentAudio.pause(); S.currentAudio = null; }
+    if (S.currentAudio) { try { S.currentAudio.stop(); } catch(e){} S.currentAudio = null; }
 
     const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
       method: 'POST',
@@ -546,6 +571,8 @@ async function speakTTS(text, targetLang) {
 
     // Decode via AudioContext (bypasses autoplay restrictions)
     const ctx = ensureAudioCtx();
+    // Force resume in case mobile suspended it
+    if (ctx.state === 'suspended') await ctx.resume();
     const arrayBuf = await res.arrayBuffer();
     const audioBuf = await ctx.decodeAudioData(arrayBuf);
 
