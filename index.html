@@ -8,6 +8,8 @@
 <meta name="mobile-web-app-capable" content="yes">
 <link rel="manifest" href="data:application/json,{&quot;name&quot;:&quot;WYYYES Interpreter&quot;,&quot;short_name&quot;:&quot;통역&quot;,&quot;display&quot;:&quot;standalone&quot;,&quot;background_color&quot;:&quot;%23f8fafc&quot;,&quot;theme_color&quot;:&quot;%23f8fafc&quot;}">
 <title>WYYYES 일본 영업 미팅 통역 에이전트</title>
+<link rel="preconnect" href="https://api.elevenlabs.io">
+<link rel="preconnect" href="https://api.mymemory.translated.net">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
@@ -190,6 +192,13 @@ body{font-family:'Pretendard',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-s
       <input type="range" id="similarity" min="0" max="1" step="0.05" value="0.75">
       <span class="val" id="similarityVal">0.75</span>
     </div>
+    <div class="setting-group">
+      <label>속도 모드</label>
+      <select id="speedMode">
+        <option value="turbo" selected>⚡ 터보 (빠름)</option>
+        <option value="quality">🎵 고품질 (느림)</option>
+      </select>
+    </div>
   </div>
 
   <!-- Main Panels -->
@@ -260,6 +269,7 @@ const S = {
   log: [],
   stability: 0.5,
   similarity: 0.75,
+  speedMode: 'turbo',
   processing: false,
   currentAudio: null,
   connected: false
@@ -431,8 +441,13 @@ function stopRec(panel) {
   }
 }
 
-// ===== TRANSLATION =====
+// ===== TRANSLATION (with cache) =====
+const translateCache = new Map();
+
 async function translateText(text, from, to) {
+  const cacheKey = `${from}|${to}|${text}`;
+  if (translateCache.has(cacheKey)) return translateCache.get(cacheKey);
+
   const langPair = `${from}|${to}`;
   const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${langPair}`;
 
@@ -440,7 +455,10 @@ async function translateText(text, from, to) {
     const res = await fetch(url);
     const data = await res.json();
     if (data.responseStatus === 200 && data.responseData) {
-      return data.responseData.translatedText;
+      const result = data.responseData.translatedText;
+      translateCache.set(cacheKey, result);
+      if (translateCache.size > 200) translateCache.delete(translateCache.keys().next().value);
+      return result;
     }
     throw new Error('Translation failed');
   } catch(e) {
@@ -448,7 +466,10 @@ async function translateText(text, from, to) {
       const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(url)}`;
       const res = await fetch(proxyUrl);
       const data = await res.json();
-      if (data.responseData) return data.responseData.translatedText;
+      if (data.responseData) {
+        translateCache.set(cacheKey, data.responseData.translatedText);
+        return data.responseData.translatedText;
+      }
     } catch(e2) {}
     showToast('번역 실패. 잠시 후 다시 시도해주세요.', 'error');
     return null;
@@ -495,12 +516,16 @@ async function speakTTS(text, targetLang) {
   try {
     if (S.currentAudio) { try { S.currentAudio.stop(); } catch(e){} S.currentAudio = null; }
 
-    const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+    const isTurbo = S.speedMode === 'turbo';
+    const modelId = isTurbo ? 'eleven_turbo_v2_5' : 'eleven_multilingual_v2';
+    const outputFormat = isTurbo ? 'mp3_22050_32' : 'mp3_44100_128';
+
+    const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=${outputFormat}&optimize_streaming_latency=${isTurbo ? 4 : 0}`, {
       method: 'POST',
       headers: { 'xi-api-key': S.apiKey, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         text: text,
-        model_id: 'eleven_multilingual_v2',
+        model_id: modelId,
         voice_settings: { stability: S.stability, similarity_boost: S.similarity }
       })
     });
@@ -647,6 +672,7 @@ voiceJPSel.onchange = () => { S.voiceJP = voiceJPSel.value; };
 
 $('stability').oninput = function() { S.stability = +this.value; $('stabilityVal').textContent = (+this.value).toFixed(2); };
 $('similarity').oninput = function() { S.similarity = +this.value; $('similarityVal').textContent = (+this.value).toFixed(2); };
+$('speedMode').onchange = function() { S.speedMode = this.value; };
 
 $('copyLogBtn').onclick = copyLog;
 $('clearLogBtn').onclick = clearLog;
