@@ -390,6 +390,9 @@ function startRec(panel) {
   transcript.innerHTML = '<span class="interim">듣는 중...</span>';
 
   let clearTimer = null;
+  let interimTimer = null;     // interim 안정화 감지 타이머
+  let lastInterim = '';        // 마지막 interim 텍스트
+  let processedInterim = '';   // 이미 처리한 interim (중복 방지)
 
   r.onresult = (e) => {
     if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
@@ -402,16 +405,38 @@ function startRec(panel) {
     }
 
     if (final) {
+      // isFinal 확정 — 이미 interim으로 처리했으면 스킵
       if (clearTimer) clearTimeout(clearTimer);
-      transcript.innerHTML = final;
-      processUtterance(final.trim(), panel);
-      // 3초 후 텍스트 클리어, 다음 발화 대기
+      if (interimTimer) { clearTimeout(interimTimer); interimTimer = null; }
+      const trimmed = final.trim();
+      transcript.innerHTML = trimmed;
+      if (trimmed && trimmed !== processedInterim) {
+        processUtterance(trimmed, panel);
+      }
+      processedInterim = '';
+      lastInterim = '';
       clearTimer = setTimeout(() => {
         transcript.innerHTML = '<span class="interim">듣는 중...</span>';
       }, 3000);
     } else if (interim) {
       if (clearTimer) { clearTimeout(clearTimer); clearTimer = null; }
       transcript.innerHTML = '<span class="interim">' + interim + '</span>';
+
+      // interim이 안정되면 (500ms 동안 변화 없으면) 즉시 번역 시작
+      lastInterim = interim.trim();
+      if (interimTimer) clearTimeout(interimTimer);
+      if (lastInterim.length >= 2 && lastInterim !== processedInterim) {
+        interimTimer = setTimeout(() => {
+          if (lastInterim && lastInterim !== processedInterim) {
+            transcript.innerHTML = lastInterim;
+            processedInterim = lastInterim;
+            processUtterance(lastInterim, panel);
+            clearTimer = setTimeout(() => {
+              transcript.innerHTML = '<span class="interim">듣는 중...</span>';
+            }, 3000);
+          }
+        }, 500);
+      }
     }
   };
 
@@ -449,7 +474,7 @@ function stopRec(panel) {
 // ===== TRANSLATION (with cache) =====
 const translateCache = new Map();
 
-async function translateText(text, from, to) {
+async function translateText(text, from, to, signal) {
   const cacheKey = `${from}|${to}|${text}`;
   if (translateCache.has(cacheKey)) return translateCache.get(cacheKey);
 
@@ -457,7 +482,7 @@ async function translateText(text, from, to) {
   const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${langPair}`;
 
   try {
-    const res = await fetch(url);
+    const res = await fetch(url, { signal });
     const data = await res.json();
     if (data.responseStatus === 200 && data.responseData) {
       const result = data.responseData.translatedText;
@@ -467,15 +492,18 @@ async function translateText(text, from, to) {
     }
     throw new Error('Translation failed');
   } catch(e) {
+    if (e.name === 'AbortError') throw e;
     try {
       const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(url)}`;
-      const res = await fetch(proxyUrl);
+      const res = await fetch(proxyUrl, { signal });
       const data = await res.json();
       if (data.responseData) {
         translateCache.set(cacheKey, data.responseData.translatedText);
         return data.responseData.translatedText;
       }
-    } catch(e2) {}
+    } catch(e2) {
+      if (e2.name === 'AbortError') throw e2;
+    }
     showToast('번역 실패. 잠시 후 다시 시도해주세요.', 'error');
     return null;
   }
@@ -510,7 +538,7 @@ function unlockAudio() {
 });
 
 // ===== TTS (ElevenLabs) =====
-async function speakTTS(text, targetLang) {
+async function speakTTS(text, targetLang, signal) {
   if (!S.connected || !S.apiKey) return;
 
   const voiceId = targetLang === 'ko' ? S.voiceKR : S.voiceJP;
@@ -519,7 +547,12 @@ async function speakTTS(text, targetLang) {
   const audioIndicator = targetLang === 'ja' ? audioJP : audioKR;
 
   try {
+    // 이전 오디오 즉시 중단
     if (S.currentAudio) { try { S.currentAudio.stop(); } catch(e){} S.currentAudio = null; }
+    audioKR.classList.remove('active');
+    audioJP.classList.remove('active');
+
+    if (signal && signal.aborted) return;
 
     const isTurbo = S.speedMode === 'turbo';
     const modelId = isTurbo ? 'eleven_turbo_v2_5' : 'eleven_multilingual_v2';
@@ -532,7 +565,8 @@ async function speakTTS(text, targetLang) {
         text: text,
         model_id: modelId,
         voice_settings: { stability: S.stability, similarity_boost: S.similarity }
-      })
+      }),
+      signal
     });
 
     if (!res.ok) {
@@ -566,55 +600,56 @@ async function speakTTS(text, targetLang) {
   } catch(e) {
     audioIndicator.classList.remove('active');
     S.currentAudio = null;
+    if (e.name === 'AbortError') return; // 새 발화로 취소됨
     console.error('TTS error:', e);
     showToast('음성 합성 실패: ' + e.message, 'error');
   }
 }
 
-// ===== PIPELINE (Queue-based) =====
-const utteranceQueue = [];
-let queueRunning = false;
+// ===== PIPELINE (Immediate + Cancel previous) =====
+let currentAbort = null;  // AbortController for in-flight requests
 
 function processUtterance(text, sourcePanel) {
   if (!text) return;
-  utteranceQueue.push({ text, sourcePanel });
-  if (!queueRunning) runQueue();
+  // Cancel any in-flight translation/TTS for faster response
+  if (currentAbort) { currentAbort.abort(); }
+  currentAbort = new AbortController();
+  runPipeline(text, sourcePanel, currentAbort.signal);
 }
 
-async function runQueue() {
-  if (utteranceQueue.length === 0) { queueRunning = false; return; }
-  queueRunning = true;
-
-  const { text, sourcePanel } = utteranceQueue.shift();
+async function runPipeline(text, sourcePanel, signal) {
   const srcLang = sourcePanel === 'kr' ? 'ko' : 'ja';
   const tgtLang = sourcePanel === 'kr' ? 'ja' : 'ko';
   const translationBox = sourcePanel === 'kr' ? translationKR : translationJP;
 
   translationBox.innerHTML = '<span class="interim">번역 중...</span>';
 
-  const translated = await translateText(text, srcLang, tgtLang);
-  if (!translated) {
-    translationBox.innerHTML = '<span style="color:var(--jp)">번역 실패</span>';
-    runQueue();
-    return;
-  }
+  try {
+    // 1. Translate (with abort support)
+    const translated = await translateText(text, srcLang, tgtLang, signal);
+    if (!translated || signal.aborted) return;
 
-  translationBox.textContent = translated;
-  addLogEntry(sourcePanel, text, translated);
+    translationBox.textContent = translated;
+    addLogEntry(sourcePanel, text, translated);
 
-  if (S.connected) {
-    await speakTTS(translated, tgtLang);
-  }
-
-  // TTS 재생 완료 후 3초 뒤 번역 박스도 클리어
-  setTimeout(() => {
-    if (translationBox.textContent === translated) {
-      const placeholder = sourcePanel === 'kr' ? '번역 결과가 여기에 표시됩니다' : '翻訳結果がここに表示されます';
-      translationBox.innerHTML = '<span class="placeholder-text">' + placeholder + '</span>';
+    // 2. TTS — 번역 완료 즉시 시작 (이전 오디오 자동 중단)
+    if (S.connected) {
+      await speakTTS(translated, tgtLang, signal);
     }
-  }, 3000);
 
-  runQueue();
+    // 3초 후 번역 박스 클리어
+    if (!signal.aborted) {
+      setTimeout(() => {
+        if (translationBox.textContent === translated) {
+          const placeholder = sourcePanel === 'kr' ? '번역 결과가 여기에 표시됩니다' : '翻訳結果がここに表示されます';
+          translationBox.innerHTML = '<span class="placeholder-text">' + placeholder + '</span>';
+        }
+      }, 3000);
+    }
+  } catch(e) {
+    if (e.name === 'AbortError') return; // 새 발화로 취소됨 — 정상
+    console.error('Pipeline error:', e);
+  }
 }
 
 // ===== MEETING LOG =====
